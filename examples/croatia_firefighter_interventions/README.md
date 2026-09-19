@@ -35,6 +35,17 @@ Each report yields national totals plus one record per narrated incident:
 Output is `dvoc_reports.ndjson` (full reports) and `dvoc_incidents.csv`
 (flattened incidents).
 
+## How it uses Firecrawl
+
+The news listing is scraped once for `links` to discover the `dvoc-*` report
+URLs. Those reports are then pulled in a single **`batch_scrape`** call — one job
+that scrapes every URL server-side and runs the same JSON extraction on each,
+rather than a scrape-and-extract round trip per URL. Because a published DVOC
+report never changes, the batch runs with **`max_age`** set to seven days, so
+reports seen on an earlier run come straight from Firecrawl's cache instead of
+being fetched and re-extracted. The job reports how many URLs completed and the
+credits it used.
+
 ## Two caveats
 
 **It is a digest, not a live feed.** The report covers a 07:00–07:00 window and

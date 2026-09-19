@@ -48,6 +48,10 @@ SITE_ROOT = "https://hvz.gov.hr"
 LISTING_URL = SITE_ROOT + "/vijesti/8"
 REPORT_PATH_PATTERN = re.compile(r"^/vijesti/dvoc-[a-z0-9-]+/\d+$")
 
+# A published DVOC report never changes, so Firecrawl may serve a cached copy
+# instead of re-fetching and re-extracting on every run. Seven days in ms.
+CACHE_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000
+
 
 class Incident(BaseModel):
     """A single narrated intervention within a DVOC report."""
@@ -103,21 +107,41 @@ def discover_report_urls(firecrawl: Firecrawl, pages: int) -> List[str]:
     return urls
 
 
-def extract_report(firecrawl: Firecrawl, url: str) -> Optional[dict]:
-    """Scrape one DVOC report and extract it into the DvocReport schema."""
-    doc = firecrawl.scrape(
-        url,
+def extract_reports(firecrawl: Firecrawl, urls: List[str]) -> List[dict]:
+    """Extract every DVOC report in one batch-scrape job.
+
+    Firecrawl scrapes the whole list server-side and runs the same JSON
+    extraction on each page, so this is one call instead of one per URL.
+    max_age lets already-seen reports come back from cache.
+    """
+    job = firecrawl.batch_scrape(
+        urls,
         formats=[{"type": "json", "schema": DvocReport}],
         only_main_content=True,
+        max_age=CACHE_MAX_AGE_MS,
     )
 
-    if not doc.json:
-        print("{}  no JSON extracted{}".format(Colors.RED, Colors.RESET))
-        return None
+    reports: List[dict] = []
+    for doc in job.data:
+        if not doc.json:
+            continue
+        report = dict(doc.json)
+        report["source_url"] = doc.metadata_typed.source_url
+        reports.append(report)
 
-    report = dict(doc.json)
-    report["source_url"] = url
-    return report
+    # The batch may return documents in any order; keep output newest-first by
+    # the numeric article id that ends each report URL.
+    def article_id(report: dict) -> int:
+        url = report.get("source_url") or ""
+        tail = url.rsplit("/", 1)[-1]
+        return int(tail) if tail.isdigit() else 0
+
+    reports.sort(key=article_id, reverse=True)
+
+    credits = "" if job.credits_used is None else " ({} credits)".format(job.credits_used)
+    print("{}Batch {}: {}/{} scraped, {} report(s) extracted{}{}".format(
+        Colors.CYAN, job.status, job.completed, job.total, len(reports), credits, Colors.RESET))
+    return reports
 
 
 def write_outputs(reports: List[dict], out_dir: str) -> None:
@@ -171,24 +195,20 @@ def main() -> int:
         print("{}No DVOC reports found -- the listing layout may have changed.{}".format(Colors.RED, Colors.RESET))
         return 1
 
-    print("{}Found {} report(s), extracting {}{}".format(Colors.CYAN, len(urls), min(len(urls), args.limit), Colors.RESET))
+    selected = urls[: args.limit]
+    print("{}Found {} report(s), extracting {}{}".format(Colors.CYAN, len(urls), len(selected), Colors.RESET))
 
-    reports = []
-    for url in urls[: args.limit]:
-        print("{}Extracting {}{}".format(Colors.YELLOW, url, Colors.RESET))
-        report = extract_report(firecrawl, url)
-        if not report:
-            continue
-        reports.append(report)
+    reports = extract_reports(firecrawl, selected)
+    if not reports:
+        print("{}Nothing extracted.{}".format(Colors.RED, Colors.RESET))
+        return 1
+
+    for report in reports:
         print("  {} -- {} narrated incident(s) of {} total".format(
             report.get("period") or "?",
             len(report.get("incidents") or []),
             report.get("total_interventions") or "?",
         ))
-
-    if not reports:
-        print("{}Nothing extracted.{}".format(Colors.RED, Colors.RESET))
-        return 1
 
     write_outputs(reports, args.out)
     return 0
